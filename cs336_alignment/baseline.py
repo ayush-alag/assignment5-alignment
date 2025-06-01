@@ -1,9 +1,9 @@
 from vllm import LLM, SamplingParams
 from typing import Callable, List, Tuple
 from drgrpo_grader import r1_zero_reward_fn
-from prompts import r1_zero_prompt
 import json
 import os
+from collections import Counter
 
 QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 # LLAMA_8B_PATH = "/data/a5-alignment/models/Llama-3.1-8B"
@@ -13,6 +13,7 @@ def evaluate_vllm(
     vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
+    answers: List[str],
     eval_sampling_params: SamplingParams
 ) -> None:
     """
@@ -20,13 +21,31 @@ def evaluate_vllm(
     compute evaluation metrics, and serialize results to disk.
     """
     outputs = vllm_model.generate(prompts, eval_sampling_params)
-    reward_dicts = [reward_fn(output.outputs[0].text, output.prompt) for output in outputs]
-    return reward_dicts
+    responses = [output.outputs[0].text for output in outputs]
+    reward_dicts = [reward_fn(response, answer) for response, answer in zip(responses, answers)]
 
-def load_and_format_prompts(data_path: str) -> List[str]:
-    with open(data_path, "r") as f:
-        data = json.load(f)
-    return [r1_zero_prompt.format(question=item["question"]) for item in data]
+    info_dicts = reward_dicts
+    for info_dict in info_dicts:
+        info_dict["response"] = responses[info_dicts.index(info_dict)]
+        info_dict["answer"] = answers[info_dicts.index(info_dict)]
+
+    return info_dicts
+
+def load_and_format_prompts(data_path: str, prompt_path: str) -> List[str]:
+    BASE_DIR = os.path.dirname(__file__)
+    r1_zero_prompt_path = os.path.join(BASE_DIR, prompt_path)
+    with open(r1_zero_prompt_path, "r") as prompt_file:
+        r1_zero_prompt = prompt_file.read()
+
+    prompts = []
+    answers = []
+    with open(data_path, "r") as data_file:
+        for line in data_file:
+            data = json.loads(line)
+            prompts.append(r1_zero_prompt.format(question=data["problem"]))
+            answers.append(data["answer"])
+
+    return prompts, answers
 
 def build_llm_and_params(model_path: str) -> Tuple[LLM, SamplingParams]:
     llm = LLM(model=model_path)
@@ -40,17 +59,36 @@ def serialize_results(reward_dicts: List[dict[str, float]], output_path: str):
     with open(output_path, "w") as f:
         json.dump(reward_dicts, f)
 
-def main(data_path: str, model_path: str, output_path: str):
-    prompts = load_and_format_prompts(data_path)
+def inspect_info_dicts(info_dicts: List[dict[str, float]]):
+    counter = Counter()
+    bad_formats = []
+    bad_answers = []
+    for info_dict in info_dicts:
+        if info_dict["format_reward"] == 1.0 and info_dict["answer_reward"] == 1.0:
+            counter["correct"] += 1
+        elif info_dict["format_reward"] == 1.0 and info_dict["answer_reward"] == 0.0:
+            counter["format_correct_answer_incorrect"] += 1
+            bad_answers.append(info_dict["response"])
+        else:
+            bad_formats.append(info_dict["response"])
+            counter["incorrect"] += 1
+    print(counter)
+    print(bad_formats[:10])
+    print(bad_answers[:10])
+
+def main(data_path: str, model_path: str, output_path: str, prompt_path: str):
+    prompts, answers = load_and_format_prompts(data_path, prompt_path)
     llm, sampling_params = build_llm_and_params(model_path)
-    reward_dicts = evaluate_vllm(llm, r1_zero_reward_fn, prompts, sampling_params)
-    serialize_results(reward_dicts, output_path)
+    info_dicts = evaluate_vllm(llm, r1_zero_reward_fn, prompts, answers, sampling_params)
+    inspect_info_dicts(info_dicts)
+    serialize_results(info_dicts, output_path)
 
 if __name__ == "__main__":
     data_path = "/data/a5-alignment/MATH/validation.jsonl"
     model_path = QWEN_BASE_PATH
 
+    prompt_path = "prompts/r1_zero.prompt"
     output_dir = "/data/c-aalag/rl/baseline"
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"{model_path.split('/')[-1]}_r1_zero.jsonl")
-    main(data_path, model_path, output_path)
+    main(data_path, model_path, output_path, prompt_path)

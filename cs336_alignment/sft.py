@@ -8,6 +8,8 @@ from vllm import LLM
 import wandb
 import argparse
 import json
+from unittest.mock import patch
+from cs336_alignment.baseline import evaluate_vllm, r1_zero_reward_fn, load_and_format_prompts
 
 QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 
@@ -147,17 +149,57 @@ def sft_microbatch_train_step(
 
     return adjusted_normalized_loss, {"normalized_loss": normalized_loss}
 
+def eval_validation_set(
+    model: PreTrainedModel,
+    llm: LLM,
+    tokenizer: PreTrainedTokenizer,
+    eval_prompts: List[str],
+    eval_answers: List[str],
+) -> None:
+    load_policy_into_vllm_instance(model, llm)
+
+    sampling_params = SamplingParams(
+        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
+    )
+
+    return evaluate_vllm(llm, r1_zero_reward_fn, eval_prompts, eval_answers, sampling_params)
+
+def log_generations(generated_info_dicts: List[dict[str, float]]):
+    entropies = []
+    lengths = []
+    num_correct = 0
+    total_reward = 0
+
+    # randomly choose 10 generations
+    for info_dict in random.sample(generated_info_dicts, 10):
+        if info_dict["correct"]:
+            num_correct += 1
+        total_reward += info_dict["reward"]
+        entropies.append(info_dict["token_entropy"])
+        lengths.append(len(info_dict["response"]))
+
+    wandb.log({"eval/correct": num_correct / len(generated_info_dicts)})
+    wandb.log({"eval/entropy": sum(entropies) / len(entropies)})
+    wandb.log({"eval/length": sum(lengths) / len(lengths)})
+    wandb.log({"eval/reward": total_reward / len(generated_info_dicts)})
+
 # before this: set up wandb, model, tokenizer, slice data
 # TODO: periodically evaluate on the validation set using parallelized VLLM
 def training_loop(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
+    llm: LLM,
     prompts: List[str],
     answers: List[str],
     optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     microbatch_size: int,
     device: str,
+    eval_device: str,
+    eval_prompts: List[str],
+    eval_answers: List[str],
+    eval_steps: int,
+    max_grad_norm: float | None = 1.0
 ) -> None:
     for i in range(0, len(prompts), microbatch_size):
         microbatch_prompts = prompts[i:i+microbatch_size]
@@ -177,11 +219,22 @@ def training_loop(
         # loss and train step
         loss, loss_dict = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
         if (i + 1) % gradient_accumulation_steps == 0:
+            if max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
 
+        if i % eval_steps == 0:
+            eval_results = eval_validation_set(model, llm, tokenizer, eval_prompts, eval_answers)
+            log_generations(eval_results)
+            wandb.log({"eval/loss": eval_results["loss"]})
+
         # log the loss
-        wandb.log(loss_dict)
+        wandb.log({"train/loss": loss_dict["normalized_loss"].item()})
+
+    # eval vllm
+    eval_results = eval_validation_set(model, llm, tokenizer, eval_prompts, eval_answers)
+    wandb.log({"eval/loss": eval_results["loss"]})
 
 # TODO: log generations
 def log_generations(
@@ -205,18 +258,27 @@ def load_training_data(data_path: str, data_amount: int) -> tuple[List[str], Lis
     return prompts[:data_amount] if data_amount else prompts, answers[:data_amount] if data_amount else answers
 
 # TODO: model saving inside training loop?
-def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir: str, microbatch_size: int, gradient_accumulation_steps: int, data_amount: int):
+def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir: str, microbatch_size: int, gradient_accumulation_steps: int, data_amount: int, eval_steps: int, max_grad_norm: float = 1.0):
     setup_wandb()
 
     # load model and tokenizer
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_device = "cuda:0"
+    eval_device = "cuda:1"
     model, tokenizer = load_model_and_tokenizer(model_path)
-    model.to(device)
+    model.to(train_device)
 
     # optimize model with training data
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
     prompts, answers = load_training_data(train_data_path, data_amount)
-    training_loop(model, tokenizer, prompts, answers, optimizer, gradient_accumulation_steps, microbatch_size, device)
+
+    # eval vllm
+    prompt_path = "prompts/r1_zero.prompt"
+    eval_prompts, eval_answers = load_and_format_prompts(eval_data_path, prompt_path)
+    llm = init_vllm(model_path, device=eval_device, seed=42)
+    load_policy_into_vllm_instance(model, llm)
+    training_loop(model, tokenizer, llm, prompts, answers, optimizer, gradient_accumulation_steps,
+                  microbatch_size, train_device, eval_device, eval_prompts, eval_answers,
+                  eval_steps, max_grad_norm)
 
     # save model and tokenizer
     save_model_tokenizer(model, tokenizer, output_dir)
@@ -227,6 +289,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--data_amount", type=int, default=128, choices=[128, 256, 512, 1024, None])
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/sft")
+    parser.add_argument("--eval_steps", type=int, default=32)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for gradient clipping")
     args = parser.parse_args()
 
     main(
@@ -236,5 +300,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         microbatch_size=args.microbatch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        data_amount=args.data_amount
+        data_amount=args.data_amount,
+        eval_steps=args.eval_steps,
+        max_grad_norm=args.max_grad_norm
     )

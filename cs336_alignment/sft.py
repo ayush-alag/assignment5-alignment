@@ -152,7 +152,7 @@ def sft_microbatch_train_step(
 
     return adjusted_normalized_loss, {"normalized_loss": normalized_loss}
 
-def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn, sampling_params, num_samples: int = 100, full_dataset: bool = False):
+def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn, sampling_params, total_train_steps: int, num_samples: int = 100, full_dataset: bool = False):
     load_policy_into_vllm_instance(model, vllm)
 
     # randomly sample a set of indices
@@ -178,14 +178,19 @@ def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn, sampling
         format_reward += info_dict["format_reward"]
         answer_reward += info_dict["answer_reward"]
 
-    wandb.log({"eval/correct_length": sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0})
-    wandb.log({"eval/incorrect_length": sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0})
-    wandb.log({"eval/average_length": sum(correct_lengths + incorrect_lengths) / len(correct_lengths + incorrect_lengths) if correct_lengths + incorrect_lengths else 0})
+    correct_length = sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0
+    incorrect_length = sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0
+    average_length = sum(correct_lengths + incorrect_lengths) / len(correct_lengths + incorrect_lengths) if correct_lengths + incorrect_lengths else 0
 
     avg_format_reward = format_reward / len(eval_results)
     avg_answer_reward = answer_reward / len(eval_results)
-    wandb.log({"eval/format_reward": avg_format_reward})
-    wandb.log({"eval/answer_reward": avg_answer_reward})
+    wandb.log({"eval/correct_length": correct_length,
+               "eval/incorrect_length": incorrect_length,
+               "eval/average_length": average_length,
+               "eval/format_reward": avg_format_reward,
+               "eval/answer_reward": avg_answer_reward,
+               "eval_step": total_train_steps},
+              step=total_train_steps)
 
     # let's only keep 10 samples for the table
     eval_results = random.sample(eval_results, 10)
@@ -229,6 +234,7 @@ def training_loop(
 ) -> None:
     best_eval_reward = 0
     total_train_steps = 0
+    running_loss = 0
 
     for epoch in range(epochs):
         # shuffle the data
@@ -239,7 +245,7 @@ def training_loop(
         print(f"Epoch {epoch}")
 
         progress_bar = tqdm(range(0, len(train_prompts), microbatch_size))
-        for i in progress_bar:
+        for microbatch_idx, i in enumerate(progress_bar):
             microbatch_prompts = train_prompts[i:i+microbatch_size]
             microbatch_answers = train_answers[i:i+microbatch_size]
 
@@ -259,28 +265,30 @@ def training_loop(
 
             # loss and train step
             train_loss, loss_dict = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
-            if (i + 1) % gradient_accumulation_steps == 0:
+            running_loss += train_loss.item()
+            if (microbatch_idx + 1) % gradient_accumulation_steps == 0 or microbatch_idx == len(progress_bar) - 1:
                 if max_grad_norm:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+
                 total_train_steps += 1
+                avg_loss = running_loss / gradient_accumulation_steps
+                wandb.log({"train/loss": avg_loss, "train_step": total_train_steps}, step=total_train_steps)
+                print(f"Train loss: {avg_loss}, total train steps: {total_train_steps}")
+                running_loss = 0
 
             # eval
-            if i % eval_steps == 0:
-                avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params)
+            if (microbatch_idx + 1) % eval_steps == 0:
+                avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps)
                 print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
                 if avg_answer_reward > best_eval_reward:
                     print("Saving best model")
                     best_eval_reward = avg_answer_reward
                     save_model_tokenizer(model, tokenizer, output_dir, "best")
 
-            # log the loss
-            wandb.log({"train/loss": train_loss, "train/total_train_steps": total_train_steps})
-            progress_bar.set_postfix({"loss": train_loss, "total_train_steps": total_train_steps})
-
     # eval vllm
-    avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, full_dataset=True)
+    avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=True)
     print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
     if avg_answer_reward > best_eval_reward:
         print("Saving best model")

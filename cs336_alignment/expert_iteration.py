@@ -40,7 +40,7 @@ def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, bat
 
         sft_training_loop(model, tokenizer, vllm_model, sft_prompts, sft_answers, sft_ground_truths, optimizer,
                           gradient_accumulation_steps, microbatch_size, device, eval_prompts,
-                          eval_answers, eval_steps, eval_sampling_params, output_dir, epochs=1)
+                          eval_answers, eval_steps, eval_sampling_params, output_dir, epochs=1, half_dataset=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

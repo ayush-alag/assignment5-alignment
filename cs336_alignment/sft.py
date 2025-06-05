@@ -224,6 +224,7 @@ def sft_training_loop(
     max_grad_norm: float | None = 1.0,
     epochs: int = 10,
     save_filtered: bool = False,
+    half_dataset: bool = False,
 ) -> None:
     best_eval_reward = 0
     total_train_steps = 0
@@ -286,7 +287,11 @@ def sft_training_loop(
                     save_model_tokenizer(model, tokenizer, output_dir, "best")
 
     # eval vllm
-    avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=True)
+    if half_dataset:
+        avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=True)
+    else:
+        avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=False, num_samples=1000)
+
     print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
     if avg_answer_reward > best_eval_reward:
         print("Saving best model")

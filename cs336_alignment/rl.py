@@ -1,9 +1,12 @@
 from collections import defaultdict
+import argparse
 import numpy as np
 import statistics
 import torch
 from typing import Literal
-from cs336_alignment.sft import get_response_log_probs
+from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, load_training_data, \
+                                load_and_format_prompts
+from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 def compute_group_normalized_rewards(
@@ -129,34 +132,12 @@ def generate_rollout_responses(
 def get_rollout_prompts(n_prompts_per_batch: int):
     pass
 
-def grpo_train_loop():
-    # define hyperparameters
-    n_grpo_steps: int = 200
-    learning_rate: float = 1e-5
-    advantage_eps: float = 1e-6
-    rollout_batch_size: int = 256
-    group_size: int = 8
-    sampling_temperature: float = 1.0
-    sampling_min_tokens: int = 4 # As in Expiter, disallow empty string responses
-    sampling_max_tokens: int = 1024
-    epochs_per_rollout_batch: int = 1 # On-policy
-    train_batch_size: int = 256 # On-policy
-    gradient_accumulation_steps: int = 128 # microbatch size is 2, will fit on H100
-    gpu_memory_utilization: float = 0.85
-    loss_type: Literal[
-        "no_baseline",
-        "reinforce_with_baseline",
-        "grpo_clip",
-    ] = "reinforce_with_baseline"
-    use_std_normalization: bool = True
-
-    n_prompts_per_batch: int = 32 # 256 / 8 = 32
-    reward_fn = r1_zero_reward_fn
-
-    # TODO: load the policy/model
-    policy = None
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
-
+def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_size,
+                    group_size, sampling_temperature, sampling_min_tokens, sampling_max_tokens,
+                    epochs_per_rollout_batch, train_batch_size, gradient_accumulation_steps,
+                    gpu_memory_utilization, loss_type, use_std_normalization, n_prompts_per_batch,
+                    reward_fn, model, tokenizer, vllm_model, rollout_sampling_params, train_prompts,
+                    train_answers, train_ground_truths, optimizer, output_dir):
     for i in range(n_grpo_steps):
         # TODO: get a batch of questions from dataset
         rollout_prompts = get_rollout_prompts(n_prompts_per_batch)
@@ -176,3 +157,63 @@ def grpo_train_loop():
         if i % gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
+
+if __name__ == "__main__":
+    # add relevant args
+    parser = argparse.ArgumentParser()
+    # hyperparameters
+    parser.add_argument("--n_grpo_steps", type=int, default=200)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--advantage_eps", type=float, default=1e-6)
+    parser.add_argument("--rollout_batch_size", type=int, default=256)
+    parser.add_argument("--group_size", type=int, default=8)
+    parser.add_argument("--sampling_temperature", type=float, default=1.0)
+    parser.add_argument("--sampling_min_tokens", type=int, default=4)
+    parser.add_argument("--sampling_max_tokens", type=int, default=1024)
+    parser.add_argument("--epochs_per_rollout_batch", type=int, default=1)
+    parser.add_argument("--train_batch_size", type=int, default=256)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=128)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline")
+    parser.add_argument("--use_std_normalization", type=bool, default=True)
+    parser.add_argument("--n_prompts_per_batch", type=int, default=32)
+
+    # experiment args
+    parser.add_argument("--experiment_name", type=str, default="grpo")
+    parser.add_argument("--model_path", type=str, default="/data/a5-alignment/models/Qwen2.5-Math-1.5B")
+    parser.add_argument("--train_data_path", type=str, default="/data/a5-alignment/MATH/train.jsonl")
+    parser.add_argument("--data_amount", type=int, default=-1)
+    parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/grpo")
+    args = parser.parse_args()
+
+    setup_wandb(args.experiment_name)
+
+    # load model and tokenizer
+    train_device = "cuda:0"
+    eval_device = "cuda:1"
+    model, tokenizer = load_model_and_tokenizer(args.model_path)
+    model.to(train_device)
+
+    # optimize model with training data
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    train_prompts, train_answers, train_ground_truths = load_training_data(args.train_data_path, args.data_amount)
+
+    eval_sampling_params = SamplingParams(
+        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
+    )
+
+    # eval vllm
+    prompt_path = "prompts/r1_zero.prompt"
+    eval_prompts, eval_answers = load_and_format_prompts(args.train_data_path, prompt_path)
+
+    # TODO: load the policy/model
+    policy = None
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
+
+    grpo_train_loop(args.n_grpo_steps, args.learning_rate, args.advantage_eps,
+                    args.rollout_batch_size, args.group_size, args.sampling_temperature,
+                    args.sampling_min_tokens, args.sampling_max_tokens, args.epochs_per_rollout_batch,
+                    args.train_batch_size, args.gradient_accumulation_steps, args.gpu_memory_utilization,
+                    args.loss_type, args.use_std_normalization, args.n_prompts_per_batch, r1_zero_reward_fn,
+                    model, tokenizer, vllm_model, rollout_sampling_params, train_prompts, train_answers, train_ground_truths,
+                    optimizer, args.output_dir)

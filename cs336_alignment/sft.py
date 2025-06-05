@@ -1,14 +1,17 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-import torch.nn.functional as F
-from typing import List
-from transformers import PreTrainedTokenizer, PreTrainedModel
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
-from vllm import LLM
-import wandb
 import argparse
 import json
+import random
+from typing import List
 from unittest.mock import patch
+
+from tqdm import tqdm
+import wandb
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, PreTrainedModel
+from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
+
 from cs336_alignment.baseline import evaluate_vllm, r1_zero_reward_fn, load_and_format_prompts
 
 QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
@@ -49,9 +52,9 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
-def setup_wandb():
+def setup_wandb(experiment_name: str):
     # Setup wandb metrics
-    wandb.init(project="cs336-alignment", name="sft")
+    wandb.init(project="cs336-alignment", name=experiment_name)
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
     # the x‑axis for evaluation
@@ -71,9 +74,9 @@ def load_model_and_tokenizer(model_path: str):
 
     return model, tokenizer
 
-def save_model_tokenizer(model, tokenizer, output_dir: str):
-    model.save_pretrained(save_directory=output_dir)
-    tokenizer.save_pretrained(save_directory=output_dir)
+def save_model_tokenizer(model, tokenizer, output_dir: str, suffix: str = ""):
+    model.save_pretrained(save_directory=f"{output_dir}/{suffix}" if suffix else output_dir)
+    tokenizer.save_pretrained(save_directory=f"{output_dir}/{suffix}" if suffix else output_dir)
 
 def tokenize_prompt_and_output(prompt_strs: List[str], output_strs: List[str], tokenizer: PreTrainedTokenizer):
     tokenized_prompts = tokenizer(prompt_strs, padding=False, add_special_tokens=False)["input_ids"]
@@ -149,48 +152,68 @@ def sft_microbatch_train_step(
 
     return adjusted_normalized_loss, {"normalized_loss": normalized_loss}
 
-def eval_validation_set(
-    model: PreTrainedModel,
-    llm: LLM,
-    tokenizer: PreTrainedTokenizer,
-    eval_prompts: List[str],
-    eval_answers: List[str],
-) -> None:
-    load_policy_into_vllm_instance(model, llm)
+def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn, sampling_params, num_samples: int = 100, full_dataset: bool = False):
+    load_policy_into_vllm_instance(model, vllm)
 
-    sampling_params = SamplingParams(
-        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
-    )
+    # randomly sample a set of indices
+    if full_dataset:
+        eval_prompts_sample = eval_prompts
+        eval_answers_sample = eval_answers
+    else:
+        indices = random.sample(range(len(eval_prompts)), num_samples)
+        eval_prompts_sample = [eval_prompts[i] for i in indices]
+        eval_answers_sample = [eval_answers[i] for i in indices]
 
-    return evaluate_vllm(llm, r1_zero_reward_fn, eval_prompts, eval_answers, sampling_params)
+    eval_results = evaluate_vllm(vllm, reward_fn, eval_prompts_sample, eval_answers_sample, sampling_params)
 
-def log_generations(generated_info_dicts: List[dict[str, float]]):
-    entropies = []
-    lengths = []
-    num_correct = 0
-    total_reward = 0
+    correct_lengths = []
+    incorrect_lengths = []
+    format_reward = 0
+    answer_reward = 0
+    for info_dict in random.sample(eval_results, num_samples):
+        if info_dict["answer_reward"] == 1:
+            correct_lengths.append(len(info_dict["response"]))
+        else:
+            incorrect_lengths.append(len(info_dict["response"]))
+        format_reward += info_dict["format_reward"]
+        answer_reward += info_dict["answer_reward"]
 
-    # randomly choose 10 generations
-    for info_dict in random.sample(generated_info_dicts, 10):
-        if info_dict["correct"]:
-            num_correct += 1
-        total_reward += info_dict["reward"]
-        entropies.append(info_dict["token_entropy"])
-        lengths.append(len(info_dict["response"]))
+    wandb.log({"eval/correct_length": sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0})
+    wandb.log({"eval/incorrect_length": sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0})
+    wandb.log({"eval/average_length": sum(correct_lengths + incorrect_lengths) / len(correct_lengths + incorrect_lengths) if correct_lengths + incorrect_lengths else 0})
 
-    wandb.log({"eval/correct": num_correct / len(generated_info_dicts)})
-    wandb.log({"eval/entropy": sum(entropies) / len(entropies)})
-    wandb.log({"eval/length": sum(lengths) / len(lengths)})
-    wandb.log({"eval/reward": total_reward / len(generated_info_dicts)})
+    avg_format_reward = format_reward / len(eval_results)
+    avg_answer_reward = answer_reward / len(eval_results)
+    wandb.log({"eval/format_reward": avg_format_reward})
+    wandb.log({"eval/answer_reward": avg_answer_reward})
+
+    # let's only keep 10 samples for the table
+    eval_results = random.sample(eval_results, 10)
+
+    table_data = []
+    for info_dict in eval_results:
+        table_data.append([
+            info_dict["prompt"],
+            info_dict["answer"],
+            info_dict["response"],
+            info_dict["format_reward"],
+            info_dict["answer_reward"],
+        ])
+
+    wandb.log({"eval/generations": wandb.Table(
+        data=table_data,
+        columns=["Prompt", "Answer", "Response", "Format Reward", "Answer Reward"]
+    )})
+
+    return avg_answer_reward, avg_format_reward
 
 # before this: set up wandb, model, tokenizer, slice data
-# TODO: periodically evaluate on the validation set using parallelized VLLM
 def training_loop(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     llm: LLM,
-    prompts: List[str],
-    answers: List[str],
+    train_prompts: List[str],
+    train_answers: List[str],
     optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     microbatch_size: int,
@@ -199,52 +222,69 @@ def training_loop(
     eval_prompts: List[str],
     eval_answers: List[str],
     eval_steps: int,
-    max_grad_norm: float | None = 1.0
+    eval_sampling_params: SamplingParams,
+    output_dir: str,
+    max_grad_norm: float | None = 1.0,
+    epochs: int = 10,
 ) -> None:
-    for i in range(0, len(prompts), microbatch_size):
-        microbatch_prompts = prompts[i:i+microbatch_size]
-        microbatch_answers = answers[i:i+microbatch_size]
+    best_eval_reward = 0
+    total_train_steps = 0
 
-        # tokenize the data
-        tokenize_result = tokenize_prompt_and_output(microbatch_prompts, microbatch_answers, tokenizer)
-        input_ids = tokenize_result["input_ids"].to(device)
-        labels = tokenize_result["labels"].to(device)
-        response_mask = tokenize_result["response_mask"].to(device)
+    for epoch in range(epochs):
+        # shuffle the data
+        indices = list(range(len(train_prompts)))
+        random.shuffle(indices)
+        train_prompts = [train_prompts[i] for i in indices]
+        train_answers = [train_answers[i] for i in indices]
+        print(f"Epoch {epoch}")
 
-        # model response
-        model_output_dict = get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
-        policy_log_probs = model_output_dict["log_probs"].to(device)
-        token_entropy = model_output_dict["token_entropy"].to(device)
+        progress_bar = tqdm(range(0, len(train_prompts), microbatch_size))
+        for i in progress_bar:
+            microbatch_prompts = train_prompts[i:i+microbatch_size]
+            microbatch_answers = train_answers[i:i+microbatch_size]
 
-        # loss and train step
-        loss, loss_dict = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
-        if (i + 1) % gradient_accumulation_steps == 0:
-            if max_grad_norm:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
+            # log the epoch
+            progress_bar.set_description(f"Epoch {epoch}")
 
-        if i % eval_steps == 0:
-            eval_results = eval_validation_set(model, llm, tokenizer, eval_prompts, eval_answers)
-            log_generations(eval_results)
-            wandb.log({"eval/loss": eval_results["loss"]})
+            # tokenize the data
+            tokenize_result = tokenize_prompt_and_output(microbatch_prompts, microbatch_answers, tokenizer)
+            input_ids = tokenize_result["input_ids"].to(device)
+            labels = tokenize_result["labels"].to(device)
+            response_mask = tokenize_result["response_mask"].to(device)
 
-        # log the loss
-        wandb.log({"train/loss": loss_dict["normalized_loss"].item()})
+            # model response
+            model_output_dict = get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
+            policy_log_probs = model_output_dict["log_probs"].to(device)
+            token_entropy = model_output_dict["token_entropy"].to(device)
+
+            # loss and train step
+            train_loss, loss_dict = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
+            if (i + 1) % gradient_accumulation_steps == 0:
+                if max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+                total_train_steps += 1
+
+            # eval
+            if i % eval_steps == 0:
+                avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params)
+                print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
+                if avg_answer_reward > best_eval_reward:
+                    print("Saving best model")
+                    best_eval_reward = avg_answer_reward
+                    save_model_tokenizer(model, tokenizer, output_dir, "best")
+
+            # log the loss
+            wandb.log({"train/loss": train_loss, "train/total_train_steps": total_train_steps})
+            progress_bar.set_postfix({"loss": train_loss, "total_train_steps": total_train_steps})
 
     # eval vllm
-    eval_results = eval_validation_set(model, llm, tokenizer, eval_prompts, eval_answers)
-    wandb.log({"eval/loss": eval_results["loss"]})
-
-# TODO: log generations
-def log_generations(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    prompts: List[str],
-    answers: List[str],
-) -> None:
-
-    pass
+    avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, full_dataset=True)
+    print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
+    if avg_answer_reward > best_eval_reward:
+        print("Saving best model")
+        save_model_tokenizer(model, tokenizer, output_dir, "best")
 
 def load_training_data(data_path: str, data_amount: int) -> tuple[List[str], List[str]]:
     prompts = []
@@ -257,9 +297,8 @@ def load_training_data(data_path: str, data_amount: int) -> tuple[List[str], Lis
 
     return prompts[:data_amount] if data_amount else prompts, answers[:data_amount] if data_amount else answers
 
-# TODO: model saving inside training loop?
-def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir: str, microbatch_size: int, gradient_accumulation_steps: int, data_amount: int, eval_steps: int, max_grad_norm: float = 1.0):
-    setup_wandb()
+def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir: str, microbatch_size: int, gradient_accumulation_steps: int, data_amount: int, eval_steps: int, epochs: int, max_grad_norm: float = 1.0, experiment_name: str = "sft"):
+    setup_wandb(experiment_name)
 
     # load model and tokenizer
     train_device = "cuda:0"
@@ -269,19 +308,24 @@ def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir:
 
     # optimize model with training data
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    prompts, answers = load_training_data(train_data_path, data_amount)
+    train_prompts, train_answers = load_training_data(train_data_path, data_amount)
+
+    eval_sampling_params = SamplingParams(
+        temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
+    )
 
     # eval vllm
     prompt_path = "prompts/r1_zero.prompt"
     eval_prompts, eval_answers = load_and_format_prompts(eval_data_path, prompt_path)
+
+    print(f"train_prompts: {len(train_prompts)}, train_answers: {len(train_answers)}")
+    print(f"eval_prompts: {len(eval_prompts)}, eval_answers: {len(eval_answers)}")
+
     llm = init_vllm(model_path, device=eval_device, seed=42)
     load_policy_into_vllm_instance(model, llm)
-    training_loop(model, tokenizer, llm, prompts, answers, optimizer, gradient_accumulation_steps,
+    training_loop(model, tokenizer, llm, train_prompts, train_answers, optimizer, gradient_accumulation_steps,
                   microbatch_size, train_device, eval_device, eval_prompts, eval_answers,
-                  eval_steps, max_grad_norm)
-
-    # save model and tokenizer
-    save_model_tokenizer(model, tokenizer, output_dir)
+                  eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -289,8 +333,10 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--data_amount", type=int, default=128, choices=[128, 256, 512, 1024, None])
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/sft")
-    parser.add_argument("--eval_steps", type=int, default=32)
+    parser.add_argument("--eval_steps", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for gradient clipping")
+    parser.add_argument("--experiment_name", type=str, default="sft_128")
     args = parser.parse_args()
 
     main(
@@ -302,5 +348,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         data_amount=args.data_amount,
         eval_steps=args.eval_steps,
-        max_grad_norm=args.max_grad_norm
+        epochs=args.epochs,
+        max_grad_norm=args.max_grad_norm,
+        experiment_name=args.experiment_name
     )

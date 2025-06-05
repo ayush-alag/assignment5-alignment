@@ -28,6 +28,7 @@ def evaluate_vllm(
     for info_dict in info_dicts:
         info_dict["response"] = responses[info_dicts.index(info_dict)]
         info_dict["answer"] = answers[info_dicts.index(info_dict)]
+        info_dict["prompt"] = prompts[info_dicts.index(info_dict)]
 
     return info_dicts
 

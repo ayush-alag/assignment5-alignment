@@ -6,6 +6,7 @@ from vllm import SamplingParams
 from cs336_alignment.sft import setup_wandb, load_model_and_tokenizer, load_training_data, \
                                 init_vllm, load_policy_into_vllm_instance, sft_training_loop, \
                                 load_and_format_prompts
+from cs336_alignment.baseline import run_vllm
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
@@ -22,7 +23,8 @@ def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, bat
         batch_ground_truths = [train_ground_truths[i] for i in batch_indices]
 
         # TODO: do we need to load from one model to the vllm model?
-        responses = vllm_model.generate(batch_prompts, sampling_params)
+        # I think we do this internally in sft_training_loop
+        responses = run_vllm(vllm_model, batch_prompts, sampling_params)
 
         sft_prompts = []
         sft_answers = []

@@ -258,7 +258,7 @@ def sft_training_loop(
             token_entropy = model_output_dict["token_entropy"].to(device)
 
             # loss and train step
-            train_loss, loss_dict = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
+            train_loss, _ = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
             running_loss += train_loss.item()
             if (microbatch_idx + 1) % gradient_accumulation_steps == 0 or microbatch_idx == len(progress_bar) - 1:
                 if max_grad_norm:
@@ -268,7 +268,11 @@ def sft_training_loop(
 
                 total_train_steps += 1
                 avg_loss = running_loss / gradient_accumulation_steps
-                wandb.log({"train/loss": avg_loss, "train_step": total_train_steps}, step=total_train_steps)
+                wandb.log({"train/loss": avg_loss,
+                           "train/token_entropy": token_entropy.mean(),
+                           "train_step": total_train_steps},
+                          step=total_train_steps)
+
                 progress_bar.set_postfix({"loss": avg_loss, "total_train_steps": total_train_steps})
                 running_loss = 0
 

@@ -9,6 +9,10 @@ QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 # LLAMA_8B_PATH = "/data/a5-alignment/models/Llama-3.1-8B"
 # LLAMA_70B_PATH = "/data/a5-alignment/models/Llama-3.3-70B-Instruct"
 
+def run_vllm(vllm_model, prompts, sampling_params) -> List[str]:
+    outputs = vllm_model.generate(prompts, sampling_params)
+    return [output.outputs[0].text for output in outputs]
+
 def evaluate_vllm(
     vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -20,8 +24,7 @@ def evaluate_vllm(
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
     """
-    outputs = vllm_model.generate(prompts, eval_sampling_params)
-    responses = [output.outputs[0].text for output in outputs]
+    responses = run_vllm(vllm_model, prompts, eval_sampling_params)
     reward_dicts = [reward_fn(response, answer) for response, answer in zip(responses, answers)]
 
     info_dicts = reward_dicts

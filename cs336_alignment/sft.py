@@ -205,7 +205,7 @@ def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn,
     return avg_answer_reward, avg_format_reward
 
 # before this: set up wandb, model, tokenizer, slice data
-def training_loop(
+def sft_training_loop(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     llm: LLM,
@@ -216,7 +216,6 @@ def training_loop(
     gradient_accumulation_steps: int,
     microbatch_size: int,
     device: str,
-    eval_device: str,
     eval_prompts: List[str],
     eval_answers: List[str],
     eval_steps: int,
@@ -354,9 +353,9 @@ def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir:
 
     llm = init_vllm(model_path, device=eval_device, seed=42)
     load_policy_into_vllm_instance(model, llm)
-    training_loop(model, tokenizer, llm, train_prompts, train_answers, train_ground_truths, optimizer, gradient_accumulation_steps,
-                  microbatch_size, train_device, eval_device, eval_prompts, eval_answers,
-                  eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs, save_filtered)
+    sft_training_loop(model, tokenizer, llm, train_prompts, train_answers, train_ground_truths, optimizer, gradient_accumulation_steps,
+                      microbatch_size, train_device, eval_device, eval_prompts, eval_answers,
+                      eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs, save_filtered)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

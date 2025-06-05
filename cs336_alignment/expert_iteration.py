@@ -52,6 +52,7 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_name", type=str, default="expert_iteration")
     parser.add_argument("--model_path", type=str, default="/data/a5-alignment/models/Qwen2.5-Math-1.5B")
     parser.add_argument("--train_data_path", type=str, default="/data/a5-alignment/MATH/sft.jsonl")
+    parser.add_argument("--eval_data_path", type=str, default="/data/a5-alignment/MATH/validation.jsonl")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--microbatch_size", type=int, default=2)
     parser.add_argument("--eval_steps", type=int, default=128)
@@ -84,7 +85,7 @@ if __name__ == "__main__":
     )
 
     prompt_path = "prompts/r1_zero.prompt"
-    eval_prompts, eval_answers = load_and_format_prompts(args.train_data_path, prompt_path)
+    eval_prompts, eval_answers = load_and_format_prompts(args.eval_data_path, prompt_path)
 
     # vllm for generating the rollouts
     llm = init_vllm(args.model_path, device=eval_device, seed=42)

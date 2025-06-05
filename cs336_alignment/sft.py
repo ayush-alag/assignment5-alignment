@@ -288,9 +288,9 @@ def sft_training_loop(
 
     # eval vllm
     if half_dataset:
-        avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=True)
-    else:
         avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=False, num_samples=1000)
+    else:
+        avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps, full_dataset=True)
 
     print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
     if avg_answer_reward > best_eval_reward:

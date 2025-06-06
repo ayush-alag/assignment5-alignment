@@ -5,9 +5,10 @@ import statistics
 import torch
 from typing import Literal
 from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, load_training_data, \
-                                load_and_format_prompts, init_vllm, load_policy_into_vllm_instance
+                                load_and_format_prompts, init_vllm, load_policy_into_vllm_instance, log_generations
 from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.baseline import run_vllm
 
 def compute_group_normalized_rewards(
     reward_fn,
@@ -119,11 +120,13 @@ def grpo_microbatch_train_step(
 def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_size,
                     group_size, rollout_sampling_params, eval_sampling_params,
                     n_train_steps_per_rollout_batch, train_batch_size, gradient_accumulation_steps,
-                    gpu_memory_utilization, loss_type, use_std_normalization, n_prompts_per_batch,
-                    reward_fn, model, tokenizer, llm, rollout_sampling_params, train_prompts,
-                    train_answers, output_dir):
+                    loss_type, use_std_normalization, n_prompts_per_batch,
+                    reward_fn, model, tokenizer, llm, train_prompts,
+                    train_answers, output_dir, cliprange, eval_steps,
+                    eval_prompts, eval_answers):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
+    total_train_steps = 0
     for i in range(n_grpo_steps):
         # get train_batch_size prompts
         print(f"GRPO iteration {i}")
@@ -132,29 +135,47 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_si
         batch_prompts = [train_prompts[i] for i in batch_indices]
         batch_answers = [train_answers[i] for i in batch_indices]
 
-        responses = run_vllm(llm, batch_prompts, rollout_sampling_params)
-        print("num prompts:", len(batch_prompts))
-        print("num generated:", len(responses))
+        progress_bar = tqdm(range(0, len(batch_prompts), train_batch_size))
+        for microbatch_idx, i in enumerate(progress_bar):
+            microbatch_prompts = batch_prompts[i:i+train_batch_size]
+            microbatch_answers = batch_answers[i:i+train_batch_size]
 
-        repeated_ground_truths = []
-        for answer in batch_answers:
-            repeated_ground_truths.extend([answer] * group_size)
+            progress_bar.set_description(f"GRPO iteration {i}")
 
-        advantages, raw_rewards, metadata = compute_group_normalized_rewards(
-            reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
-        )
+            responses, log_probs = run_vllm(llm, microbatch_prompts, rollout_sampling_params)
+            print("num prompts:", len(microbatch_prompts))
+            print("num generated:", len(responses))
 
-        policy_log_probs = get_response_log_probs(model, responses)
+            repeated_ground_truths = []
+            for answer in microbatch_answers:
+                repeated_ground_truths.extend([answer] * group_size)
 
-        # > 1 for off-policy
-        for j in range(n_train_steps_per_rollout_batch):
-            grpo_microbatch_train_step(
-                policy_log_probs, response_mask, gradient_accumulation_steps, loss_type, raw_rewards, advantages, old_log_probs, cliprange
+            advantages, raw_rewards, metadata = compute_group_normalized_rewards(
+                reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
             )
 
-            if i % gradient_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+            # TODO: check that we can do this
+            policy_log_probs = torch.tensor(log_probs)
+            response_mask = torch.ones_like(policy_log_probs)
+
+            # TODO: importance sampling
+            old_log_probs = policy_log_probs.clone()
+            # > 1 for off-policy
+            for j in range(n_train_steps_per_rollout_batch):
+                loss, metadata = grpo_microbatch_train_step(
+                    policy_log_probs, response_mask, gradient_accumulation_steps,
+                    loss_type, raw_rewards, advantages, old_log_probs, cliprange
+                )
+                loss.backward()
+
+                total_train_steps += 1
+                if total_train_steps % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+            if total_train_steps % eval_steps == 0:
+                eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
+                                            eval_sampling_params, total_train_steps, n_prompts_per_batch)
 
 if __name__ == "__main__":
     # add relevant args
@@ -171,18 +192,32 @@ if __name__ == "__main__":
     parser.add_argument("--n_train_steps_per_rollout_batch", type=int, default=1)
     parser.add_argument("--train_batch_size", type=int, default=256)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=128)
-    # parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline")
     parser.add_argument("--use_std_normalization", type=bool, default=True)
     parser.add_argument("--n_prompts_per_batch", type=int, default=32)
-
+    parser.add_argument("--cliprange", type=float, default=0.2)
     # experiment args
     parser.add_argument("--experiment_name", type=str, default="grpo")
     parser.add_argument("--model_path", type=str, default="/data/a5-alignment/models/Qwen2.5-Math-1.5B")
     parser.add_argument("--train_data_path", type=str, default="/data/a5-alignment/MATH/train.jsonl")
+    parser.add_argument("--eval_data_path", type=str, default="/data/a5-alignment/MATH/validation.jsonl")
     parser.add_argument("--data_amount", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/grpo")
+    parser.add_argument("--eval_steps", type=int, default=10)
     args = parser.parse_args()
+
+    assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
+        "train_batch_size must be divisible by gradient_accumulation_steps"
+    )
+    micro_train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+    assert args.rollout_batch_size % args.group_size == 0, (
+        "rollout_batch_size must be divisible by group_size"
+    )
+    n_prompts_per_rollout_batch = args.rollout_batch_size // args.group_size
+    assert args.train_batch_size >= args.group_size, (
+        "train_batch_size must be greater than or equal to group_size"
+    )
+    n_microbatches_per_rollout_batch = args.rollout_batch_size // micro_train_batch_size
 
     setup_wandb(args.experiment_name)
 
@@ -198,7 +233,8 @@ if __name__ == "__main__":
         n=args.rollout_batch_size,
         seed=42,
         stop=["</answer>"],
-        include_stop_str_in_output=True
+        include_stop_str_in_output=True,
+        logprobs=1
     )
 
     eval_sampling_params = SamplingParams(
@@ -208,7 +244,7 @@ if __name__ == "__main__":
     # eval vllm
     prompt_path = "prompts/r1_zero.prompt"
     train_prompts, train_answers = load_and_format_prompts(args.train_data_path, prompt_path)
-    eval_prompts, eval_answers = load_and_format_prompts(args.train_data_path, prompt_path)
+    eval_prompts, eval_answers = load_and_format_prompts(args.eval_data_path, prompt_path)
 
     # vllm for generating the rollouts
     llm = init_vllm(args.model_path, device=device, seed=42)
@@ -219,5 +255,6 @@ if __name__ == "__main__":
                     args.n_train_steps_per_rollout_batch,
                     args.train_batch_size, args.gradient_accumulation_steps,
                     args.loss_type, args.use_std_normalization, args.n_prompts_per_batch, r1_zero_reward_fn,
-                    model, tokenizer, llm, rollout_sampling_params, train_prompts, train_answers,
-                    args.output_dir)
+                    model, tokenizer, llm, train_prompts, train_answers,
+                    args.output_dir, args.cliprange, args.eval_steps,
+                    eval_prompts, eval_answers)

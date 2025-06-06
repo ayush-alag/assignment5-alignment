@@ -19,6 +19,7 @@ def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, bat
     total_training_steps = 0
     for i in range(n_ei_steps):
         print(f"Expert iteration {i}")
+        load_policy_into_vllm_instance(model, vllm_model)
         batch_indices = random.sample(range(len(train_prompts)), batch_size_per_ei_step)
         batch_prompts = [train_prompts[i] for i in batch_indices]
         batch_answers = [train_answers[i] for i in batch_indices]
@@ -84,12 +85,14 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
     rollout_sampling_params = SamplingParams(
-        temperature=0.75,
-        top_p=0.9,
+        temperature=1,
+        top_p=1,
         max_tokens=args.sampling_max_tokens,
         min_tokens=args.sampling_min_tokens,
         n=args.G,
         seed=42,
+        stop=["</answer>"],
+        include_stop_str_in_output=True
     )
 
     eval_sampling_params = SamplingParams(

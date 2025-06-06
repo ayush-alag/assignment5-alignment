@@ -4,11 +4,13 @@ import numpy as np
 import statistics
 import torch
 from typing import Literal
-from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, load_training_data, \
+from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, \
                                 load_and_format_prompts, init_vllm, load_policy_into_vllm_instance, log_generations
 from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.baseline import run_vllm
+import random
+from tqdm import tqdm
 
 def compute_group_normalized_rewards(
     reward_fn,
@@ -117,10 +119,12 @@ def grpo_microbatch_train_step(
 
     return scaled_response_policy_loss, metadata
 
-def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_size,
+def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     group_size, rollout_sampling_params, eval_sampling_params,
-                    n_train_steps_per_rollout_batch, train_batch_size, gradient_accumulation_steps,
-                    loss_type, use_std_normalization, n_prompts_per_batch,
+                    n_train_steps_per_rollout_batch, train_batch_size, micro_train_batch_size,
+                    gradient_accumulation_steps, n_prompts_per_rollout_batch,
+                    n_microbatches_per_rollout_batch,
+                    loss_type, use_std_normalization,
                     reward_fn, model, tokenizer, llm, train_prompts,
                     train_answers, output_dir, cliprange, eval_steps,
                     eval_prompts, eval_answers):
@@ -131,37 +135,41 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_si
         # get train_batch_size prompts
         print(f"GRPO iteration {i}")
         load_policy_into_vllm_instance(model, llm)
-        batch_indices = random.sample(range(len(train_prompts)), train_batch_size)
+        # 32 prompts
+        batch_indices = random.sample(range(len(train_prompts)), n_prompts_per_rollout_batch)
         batch_prompts = [train_prompts[i] for i in batch_indices]
         batch_answers = [train_answers[i] for i in batch_indices]
 
-        progress_bar = tqdm(range(0, len(batch_prompts), train_batch_size))
-        for microbatch_idx, i in enumerate(progress_bar):
-            microbatch_prompts = batch_prompts[i:i+train_batch_size]
-            microbatch_answers = batch_answers[i:i+train_batch_size]
+        # now these are size rollout_batch_size (n_prompts_per_rollout_batch * group_size) = 256
+        responses, log_probs = run_vllm(llm, batch_prompts, rollout_sampling_params, log_probs=True)
+        print("num prompts:", len(batch_prompts))
+        print("num generated:", len(responses))
 
-            progress_bar.set_description(f"GRPO iteration {i}")
+        repeated_ground_truths = []
+        for answer in batch_answers:
+            repeated_ground_truths.extend([answer] * group_size)
 
-            responses, log_probs = run_vllm(llm, microbatch_prompts, rollout_sampling_params)
-            print("num prompts:", len(microbatch_prompts))
-            print("num generated:", len(responses))
+        advantages, raw_rewards, metadata = compute_group_normalized_rewards(
+            reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
+        )
 
-            repeated_ground_truths = []
-            for answer in microbatch_answers:
-                repeated_ground_truths.extend([answer] * group_size)
+        # TODO: set old_policy here
 
-            advantages, raw_rewards, metadata = compute_group_normalized_rewards(
-                reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
-            )
+        # this is 1 for on-policy, > 1 for off-policy --> this is unrelated to train batch size
+        for j in range(n_train_steps_per_rollout_batch):
+            # micro_train_batch_size = 256/128 = 2
+            # now we have rollout_batch_size for rewards, advantages, etc
+            for microbatch_idx in tqdm(range(0, len(responses), micro_train_batch_size)):
+                microbatch_responses = responses[microbatch_idx:microbatch_idx+micro_train_batch_size]
+                microbatch_log_probs = log_probs[microbatch_idx:microbatch_idx+micro_train_batch_size]
+                microbatch_advantages = advantages[microbatch_idx:microbatch_idx+micro_train_batch_size]
+                microbatch_raw_rewards = raw_rewards[microbatch_idx:microbatch_idx+micro_train_batch_size]
 
-            # TODO: check that we can do this
-            policy_log_probs = torch.tensor(log_probs)
-            response_mask = torch.ones_like(policy_log_probs)
+                policy_log_probs = torch.tensor(microbatch_log_probs)
+                response_mask = torch.ones_like(microbatch_log_probs)
 
-            # TODO: importance sampling
-            old_log_probs = policy_log_probs.clone()
-            # > 1 for off-policy
-            for j in range(n_train_steps_per_rollout_batch):
+                # TODO: define policy_log_probs and old_log_probs here
+
                 loss, metadata = grpo_microbatch_train_step(
                     policy_log_probs, response_mask, gradient_accumulation_steps,
                     loss_type, raw_rewards, advantages, old_log_probs, cliprange
@@ -173,9 +181,9 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_si
                     optimizer.step()
                     optimizer.zero_grad()
 
-            if total_train_steps % eval_steps == 0:
-                eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
-                                            eval_sampling_params, total_train_steps, n_prompts_per_batch)
+                if total_train_steps % eval_steps == 0:
+                    eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
+                                                   eval_sampling_params, total_train_steps, n_prompts_per_rollout_batch)
 
 if __name__ == "__main__":
     # add relevant args
@@ -230,7 +238,7 @@ if __name__ == "__main__":
         temperature=args.sampling_temperature,
         max_tokens=args.sampling_max_tokens,
         min_tokens=args.sampling_min_tokens,
-        n=args.rollout_batch_size,
+        n=args.group_size,
         seed=42,
         stop=["</answer>"],
         include_stop_str_in_output=True,
@@ -251,10 +259,11 @@ if __name__ == "__main__":
     load_policy_into_vllm_instance(model, llm)
 
     grpo_train_loop(args.n_grpo_steps, args.learning_rate, args.advantage_eps,
-                    args.rollout_batch_size, args.group_size, rollout_sampling_params, eval_sampling_params,
-                    args.n_train_steps_per_rollout_batch,
-                    args.train_batch_size, args.gradient_accumulation_steps,
-                    args.loss_type, args.use_std_normalization, args.n_prompts_per_batch, r1_zero_reward_fn,
+                    args.group_size, rollout_sampling_params, eval_sampling_params,
+                    args.n_train_steps_per_rollout_batch, args.train_batch_size,
+                    micro_train_batch_size, args.gradient_accumulation_steps,
+                    n_prompts_per_rollout_batch, n_microbatches_per_rollout_batch,
+                    args.loss_type, args.use_std_normalization, r1_zero_reward_fn,
                     model, tokenizer, llm, train_prompts, train_answers,
                     args.output_dir, args.cliprange, args.eval_steps,
                     eval_prompts, eval_answers)

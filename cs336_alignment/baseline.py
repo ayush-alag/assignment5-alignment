@@ -11,7 +11,7 @@ QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 
 def run_vllm(vllm_model, prompts, sampling_params) -> List[str]:
     outputs = vllm_model.generate(prompts, sampling_params)
-    return [output.outputs[0].text for output in outputs]
+    return [output.text for response in outputs for output in response.outputs]
 
 def evaluate_vllm(
     vllm_model: LLM,

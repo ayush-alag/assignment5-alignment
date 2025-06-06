@@ -17,7 +17,7 @@ from cs336_alignment.baseline import evaluate_vllm, r1_zero_reward_fn, load_and_
 
 QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.35):
     """
     Start the inference process, here we use vLLM to hold a model on
     a GPU separate from the policy.
@@ -209,9 +209,9 @@ def sft_training_loop(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     llm: LLM,
-    train_prompts: List[str],
-    train_answers: List[str],
-    train_ground_truths: List[str],
+    sft_prompts: List[str],
+    sft_cots: List[str],
+    sft_answers: List[str],
     optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     microbatch_size: int,
@@ -225,30 +225,32 @@ def sft_training_loop(
     epochs: int = 10,
     save_filtered: bool = False,
     half_dataset: bool = False,
+    starting_step: int = 0,
 ) -> None:
     best_eval_reward = 0
-    total_train_steps = 0
+    total_train_steps = starting_step
     running_loss = 0
 
     for epoch in range(epochs):
         # shuffle the data
-        indices = list(range(len(train_prompts)))
+        indices = list(range(len(sft_prompts)))
         random.shuffle(indices)
-        train_prompts = [train_prompts[i] for i in indices]
-        train_answers = [train_answers[i] for i in indices]
-        train_ground_truths = [train_ground_truths[i] for i in indices]
+        sft_prompts = [sft_prompts[i] for i in indices]
+        sft_cots = [sft_cots[i] for i in indices]
+        sft_answers = [sft_answers[i] for i in indices]
         print(f"Epoch {epoch}")
 
-        progress_bar = tqdm(range(0, len(train_prompts), microbatch_size))
+        progress_bar = tqdm(range(0, len(sft_prompts), microbatch_size))
         for microbatch_idx, i in enumerate(progress_bar):
-            microbatch_prompts = train_prompts[i:i+microbatch_size]
-            microbatch_answers = train_answers[i:i+microbatch_size]
+            microbatch_prompts = sft_prompts[i:i+microbatch_size]
+            microbatch_cots = sft_cots[i:i+microbatch_size]
+            microbatch_answers = sft_answers[i:i+microbatch_size]
 
             # log the epoch
             progress_bar.set_description(f"Epoch {epoch}")
 
             # tokenize the data
-            tokenize_result = tokenize_prompt_and_output(microbatch_prompts, microbatch_answers, tokenizer)
+            tokenize_result = tokenize_prompt_and_output(microbatch_prompts, microbatch_cots, tokenizer)
             input_ids = tokenize_result["input_ids"].to(device)
             labels = tokenize_result["labels"].to(device)
             response_mask = tokenize_result["response_mask"].to(device)
@@ -261,7 +263,7 @@ def sft_training_loop(
             # loss and train step
             train_loss, _ = sft_microbatch_train_step(policy_log_probs, response_mask, gradient_accumulation_steps)
             running_loss += train_loss.item()
-            if (microbatch_idx + 1) % gradient_accumulation_steps == 0 or microbatch_idx == len(progress_bar) - 1:
+            if microbatch_idx % gradient_accumulation_steps == 0 or microbatch_idx == len(progress_bar) - 1:
                 if max_grad_norm:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
@@ -278,7 +280,7 @@ def sft_training_loop(
                 running_loss = 0
 
             # eval
-            if (microbatch_idx + 1) % eval_steps == 0:
+            if microbatch_idx % eval_steps == 0:
                 avg_answer_reward, avg_format_reward = log_generations(model, llm, eval_prompts, eval_answers, r1_zero_reward_fn, eval_sampling_params, total_train_steps)
                 print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
                 if avg_answer_reward > best_eval_reward:
@@ -299,7 +301,7 @@ def sft_training_loop(
 
     if save_filtered:
         print("Evaluating training data to filter correct examples...")
-        train_info_dicts = evaluate_vllm(llm, r1_zero_reward_fn, train_prompts, train_ground_truths, eval_sampling_params)
+        train_info_dicts = evaluate_vllm(llm, r1_zero_reward_fn, sft_prompts, sft_answers, eval_sampling_params)
 
         filtered_data = []
         for info_dict in train_info_dicts:
@@ -317,23 +319,25 @@ def sft_training_loop(
             for item in filtered_data:
                 f.write(json.dumps(item) + "\n")
 
-def load_training_data(data_path: str, data_amount: int) -> tuple[List[str], List[str], List[str]]:
+    return total_train_steps
+
+def load_sft_data(data_path: str, data_amount: int) -> tuple[List[str], List[str], List[str]]:
     prompts = []
     answers = []
-    ground_truths = []
+    cots = []
     with open(data_path, "r") as data_file:
         for line in data_file:
             data = json.loads(line)
             prompts.append(data["prompt"])
-            answers.append(data["response"])
-            ground_truths.append(data["ground_truth"])
+            cots.append(data["response"])
+            answers.append(data["ground_truth"])
 
     if data_amount == -1:
-        return prompts, answers, ground_truths
+        return prompts, cots, answers
     else:
-        return prompts[:data_amount], answers[:data_amount], ground_truths[:data_amount]
+        return prompts[:data_amount], cots[:data_amount], answers[:data_amount]
 
-def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir: str,
+def main(sft_data_path: str, eval_data_path: str, model_path: str, output_dir: str,
          microbatch_size: int, gradient_accumulation_steps: int, data_amount: int,
          eval_steps: int, epochs: int, max_grad_norm: float = 1.0, experiment_name: str = "sft",
          save_filtered: bool = False, from_filtered: bool = False):
@@ -341,13 +345,13 @@ def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir:
 
     # load model and tokenizer
     train_device = "cuda:0"
-    eval_device = "cuda:1"
+    eval_device = "cuda:0"
     model, tokenizer = load_model_and_tokenizer(model_path)
     model.to(train_device)
 
     # optimize model with training data
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    train_prompts, train_answers, train_ground_truths = load_training_data(train_data_path, data_amount)
+    sft_prompts, sft_cots, sft_answers = load_sft_data(sft_data_path, data_amount)
 
     eval_sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
@@ -357,14 +361,14 @@ def main(train_data_path: str, eval_data_path: str, model_path: str, output_dir:
     prompt_path = "prompts/r1_zero.prompt"
     eval_prompts, eval_answers = load_and_format_prompts(eval_data_path, prompt_path)
 
-    print(f"train_prompts: {len(train_prompts)}, train_answers: {len(train_answers)}")
+    print(f"sft_prompts: {len(sft_prompts)}, sft_answers: {len(sft_answers)}")
     print(f"eval_prompts: {len(eval_prompts)}, eval_answers: {len(eval_answers)}")
 
     llm = init_vllm(model_path, device=eval_device, seed=42)
     load_policy_into_vllm_instance(model, llm)
-    sft_training_loop(model, tokenizer, llm, train_prompts, train_answers, train_ground_truths, optimizer, gradient_accumulation_steps,
-                      microbatch_size, train_device, eval_device, eval_prompts, eval_answers,
-                      eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs, save_filtered)
+    sft_training_loop(model, tokenizer, llm, sft_prompts, sft_cots, sft_answers, optimizer, gradient_accumulation_steps,
+                      microbatch_size, train_device, eval_prompts, eval_answers,
+                      eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs=epochs, save_filtered=save_filtered)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -379,14 +383,15 @@ if __name__ == "__main__":
     parser.add_argument("--save_filtered", action="store_true")
     parser.add_argument("--from_filtered", action="store_true")
     args = parser.parse_args()
+    print(args.epochs)
 
     if args.from_filtered:
-        train_data_path = os.path.join(args.output_dir, "filtered_training_data.jsonl")
+        sft_data_path = os.path.join(args.output_dir, "filtered_training_data.jsonl")
     else:
-        train_data_path = "/data/a5-alignment/MATH/sft.jsonl"
+        sft_data_path = "/data/a5-alignment/MATH/sft.jsonl"
 
     main(
-        train_data_path=train_data_path,
+        sft_data_path=sft_data_path,
         eval_data_path="/data/a5-alignment/MATH/validation.jsonl",
         model_path=QWEN_BASE_PATH,
         output_dir=args.output_dir,

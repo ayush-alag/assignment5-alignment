@@ -5,7 +5,7 @@ import statistics
 import torch
 from typing import Literal
 from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, load_training_data, \
-                                load_and_format_prompts
+                                load_and_format_prompts, init_vllm, load_policy_into_vllm_instance
 from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
@@ -116,47 +116,45 @@ def grpo_microbatch_train_step(
 
     return scaled_response_policy_loss, metadata
 
-# TODO: implement this
-def generate_rollout_responses(
-    policy,
-    rollout_prompts,
-    sampling_temperature,
-    sampling_min_tokens,
-    sampling_max_tokens,
-):
-    rollout_responses = []
-    repeated_ground_truths = []
-    pass
-    return rollout_responses, repeated_ground_truths
-
-def get_rollout_prompts(n_prompts_per_batch: int):
-    pass
-
 def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps, rollout_batch_size,
-                    group_size, sampling_temperature, sampling_min_tokens, sampling_max_tokens,
-                    epochs_per_rollout_batch, train_batch_size, gradient_accumulation_steps,
+                    group_size, rollout_sampling_params, eval_sampling_params,
+                    n_train_steps_per_rollout_batch, train_batch_size, gradient_accumulation_steps,
                     gpu_memory_utilization, loss_type, use_std_normalization, n_prompts_per_batch,
-                    reward_fn, model, tokenizer, vllm_model, rollout_sampling_params, train_prompts,
-                    train_answers, train_ground_truths, optimizer, output_dir):
+                    reward_fn, model, tokenizer, llm, rollout_sampling_params, train_prompts,
+                    train_answers, output_dir):
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
     for i in range(n_grpo_steps):
-        # TODO: get a batch of questions from dataset
-        rollout_prompts = get_rollout_prompts(n_prompts_per_batch)
-        old_policy = policy
-        # TODO: generate G outputs per question
-        rollout_responses, repeated_ground_truths = generate_rollout_responses(policy, rollout_prompts, sampling_temperature, sampling_min_tokens, sampling_max_tokens)
+        # get train_batch_size prompts
+        print(f"GRPO iteration {i}")
+        load_policy_into_vllm_instance(model, llm)
+        batch_indices = random.sample(range(len(train_prompts)), train_batch_size)
+        batch_prompts = [train_prompts[i] for i in batch_indices]
+        batch_answers = [train_answers[i] for i in batch_indices]
+
+        responses = run_vllm(llm, batch_prompts, rollout_sampling_params)
+        print("num prompts:", len(batch_prompts))
+        print("num generated:", len(responses))
+
+        repeated_ground_truths = []
+        for answer in batch_answers:
+            repeated_ground_truths.extend([answer] * group_size)
+
         advantages, raw_rewards, metadata = compute_group_normalized_rewards(
-            reward_fn, rollout_responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
+            reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
         )
 
-        policy_log_probs = get_response_log_probs(policy, rollout_responses)
+        policy_log_probs = get_response_log_probs(model, responses)
 
-        grpo_microbatch_train_step(
-            policy_log_probs, response_mask, gradient_accumulation_steps, loss_type, raw_rewards, advantages, old_log_probs, cliprange
-        )
+        # > 1 for off-policy
+        for j in range(n_train_steps_per_rollout_batch):
+            grpo_microbatch_train_step(
+                policy_log_probs, response_mask, gradient_accumulation_steps, loss_type, raw_rewards, advantages, old_log_probs, cliprange
+            )
 
-        if i % gradient_accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
+            if i % gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
 if __name__ == "__main__":
     # add relevant args
@@ -170,10 +168,10 @@ if __name__ == "__main__":
     parser.add_argument("--sampling_temperature", type=float, default=1.0)
     parser.add_argument("--sampling_min_tokens", type=int, default=4)
     parser.add_argument("--sampling_max_tokens", type=int, default=1024)
-    parser.add_argument("--epochs_per_rollout_batch", type=int, default=1)
+    parser.add_argument("--n_train_steps_per_rollout_batch", type=int, default=1)
     parser.add_argument("--train_batch_size", type=int, default=256)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=128)
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    # parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument("--loss_type", type=str, default="reinforce_with_baseline")
     parser.add_argument("--use_std_normalization", type=bool, default=True)
     parser.add_argument("--n_prompts_per_batch", type=int, default=32)
@@ -189,14 +187,19 @@ if __name__ == "__main__":
     setup_wandb(args.experiment_name)
 
     # load model and tokenizer
-    train_device = "cuda:0"
-    eval_device = "cuda:1"
+    device = "cuda:0"
     model, tokenizer = load_model_and_tokenizer(args.model_path)
-    model.to(train_device)
+    model.to(device)
 
-    # optimize model with training data
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-    train_prompts, train_answers, train_ground_truths = load_training_data(args.train_data_path, args.data_amount)
+    rollout_sampling_params = SamplingParams(
+        temperature=args.sampling_temperature,
+        max_tokens=args.sampling_max_tokens,
+        min_tokens=args.sampling_min_tokens,
+        n=args.rollout_batch_size,
+        seed=42,
+        stop=["</answer>"],
+        include_stop_str_in_output=True
+    )
 
     eval_sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
@@ -204,16 +207,17 @@ if __name__ == "__main__":
 
     # eval vllm
     prompt_path = "prompts/r1_zero.prompt"
+    train_prompts, train_answers = load_and_format_prompts(args.train_data_path, prompt_path)
     eval_prompts, eval_answers = load_and_format_prompts(args.train_data_path, prompt_path)
 
-    # TODO: load the policy/model
-    policy = None
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate, weight_decay=0.0, betas=(0.9, 0.95))
+    # vllm for generating the rollouts
+    llm = init_vllm(args.model_path, device=device, seed=42)
+    load_policy_into_vllm_instance(model, llm)
 
     grpo_train_loop(args.n_grpo_steps, args.learning_rate, args.advantage_eps,
-                    args.rollout_batch_size, args.group_size, args.sampling_temperature,
-                    args.sampling_min_tokens, args.sampling_max_tokens, args.epochs_per_rollout_batch,
-                    args.train_batch_size, args.gradient_accumulation_steps, args.gpu_memory_utilization,
+                    args.rollout_batch_size, args.group_size, rollout_sampling_params, eval_sampling_params,
+                    args.n_train_steps_per_rollout_batch,
+                    args.train_batch_size, args.gradient_accumulation_steps,
                     args.loss_type, args.use_std_normalization, args.n_prompts_per_batch, r1_zero_reward_fn,
-                    model, tokenizer, vllm_model, rollout_sampling_params, train_prompts, train_answers, train_ground_truths,
-                    optimizer, args.output_dir)
+                    model, tokenizer, llm, rollout_sampling_params, train_prompts, train_answers,
+                    args.output_dir)

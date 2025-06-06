@@ -212,7 +212,6 @@ def sft_training_loop(
     sft_prompts: List[str],
     sft_cots: List[str],
     sft_answers: List[str],
-    optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     microbatch_size: int,
     device: str,
@@ -221,12 +220,15 @@ def sft_training_loop(
     eval_steps: int,
     eval_sampling_params: SamplingParams,
     output_dir: str,
+    learning_rate: float = 1e-5,
     max_grad_norm: float | None = 1.0,
     epochs: int = 10,
     save_filtered: bool = False,
     half_dataset: bool = False,
     starting_step: int = 0,
 ) -> None:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
     best_eval_reward = 0
     total_train_steps = starting_step
     running_loss = 0
@@ -339,7 +341,7 @@ def load_sft_data(data_path: str, data_amount: int) -> tuple[List[str], List[str
 
 def main(sft_data_path: str, eval_data_path: str, model_path: str, output_dir: str,
          microbatch_size: int, gradient_accumulation_steps: int, data_amount: int,
-         eval_steps: int, epochs: int, max_grad_norm: float = 1.0, experiment_name: str = "sft",
+         eval_steps: int, epochs: int, learning_rate: float = 1e-5, max_grad_norm: float = 1.0, experiment_name: str = "sft",
          save_filtered: bool = False, from_filtered: bool = False):
     setup_wandb(experiment_name)
 
@@ -350,7 +352,6 @@ def main(sft_data_path: str, eval_data_path: str, model_path: str, output_dir: s
     model.to(train_device)
 
     # optimize model with training data
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
     sft_prompts, sft_cots, sft_answers = load_sft_data(sft_data_path, data_amount)
 
     eval_sampling_params = SamplingParams(
@@ -366,9 +367,9 @@ def main(sft_data_path: str, eval_data_path: str, model_path: str, output_dir: s
 
     llm = init_vllm(model_path, device=eval_device, seed=42)
     load_policy_into_vllm_instance(model, llm)
-    sft_training_loop(model, tokenizer, llm, sft_prompts, sft_cots, sft_answers, optimizer, gradient_accumulation_steps,
+    sft_training_loop(model, tokenizer, llm, sft_prompts, sft_cots, sft_answers, gradient_accumulation_steps,
                       microbatch_size, train_device, eval_prompts, eval_answers,
-                      eval_steps, eval_sampling_params, output_dir, max_grad_norm, epochs=epochs, save_filtered=save_filtered)
+                      eval_steps, eval_sampling_params, output_dir, learning_rate=learning_rate, max_grad_norm=max_grad_norm, epochs=epochs, save_filtered=save_filtered)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -377,7 +378,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_amount", type=int, default=128)
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/sft")
     parser.add_argument("--eval_steps", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm for gradient clipping")
     parser.add_argument("--experiment_name", type=str, default="sft_128")
     parser.add_argument("--save_filtered", action="store_true")
@@ -400,6 +402,7 @@ if __name__ == "__main__":
         data_amount=args.data_amount,
         eval_steps=args.eval_steps,
         epochs=args.epochs,
+        learning_rate=args.learning_rate,
         max_grad_norm=args.max_grad_norm,
         experiment_name=args.experiment_name,
         save_filtered=args.save_filtered,

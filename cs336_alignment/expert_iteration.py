@@ -13,8 +13,8 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, batch_size_per_ei_step,
                   train_prompts, train_answers, reward_fn,
-                  optimizer, gradient_accumulation_steps, microbatch_size, device,
-                  eval_prompts, eval_answers, eval_steps, eval_sampling_params, output_dir, G):
+                  gradient_accumulation_steps, microbatch_size, device,
+                  eval_prompts, eval_answers, eval_steps, eval_sampling_params, output_dir, G, learning_rate):
 
     total_training_steps = 0
     for i in range(n_ei_steps):
@@ -43,11 +43,11 @@ def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, bat
 
         print(f"Expert iteration {i} has {len(sft_prompts)} filtered samples")
 
-        total_training_steps = sft_training_loop(model, tokenizer, vllm_model, sft_prompts,
-                                                 sft_cots, sft_answers, optimizer,
-                                                gradient_accumulation_steps, microbatch_size, device, eval_prompts,
-                                                eval_answers, eval_steps, eval_sampling_params, output_dir, epochs=args.epochs, half_dataset=True,
-                                                starting_step=total_training_steps)
+        total_training_steps = sft_training_loop(
+            model, tokenizer, vllm_model, sft_prompts, sft_cots, sft_answers,
+            gradient_accumulation_steps, microbatch_size, device, eval_prompts,
+            eval_answers, eval_steps, eval_sampling_params, output_dir, learning_rate=learning_rate,
+            epochs=args.epochs, half_dataset=True, starting_step=total_training_steps)
 
         wandb.log({"iteration_boundary": i}, step=total_training_steps)
 
@@ -66,6 +66,7 @@ if __name__ == "__main__":
     parser.add_argument("--microbatch_size", type=int, default=2)
     parser.add_argument("--eval_steps", type=int, default=128)
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/sft_expert")
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--epochs", type=int, default=1)
     args = parser.parse_args()
 
@@ -81,12 +82,9 @@ if __name__ == "__main__":
     model, tokenizer = load_model_and_tokenizer(args.model_path)
     model.to(train_device)
 
-    # optimize model with training data
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-
     rollout_sampling_params = SamplingParams(
-        temperature=1,
-        top_p=1,
+        temperature=0.75,
+        top_p=0.9,
         max_tokens=args.sampling_max_tokens,
         min_tokens=args.sampling_min_tokens,
         n=args.G,
@@ -108,6 +106,6 @@ if __name__ == "__main__":
     load_policy_into_vllm_instance(model, llm)
 
     training_loop(args.n_ei_steps, model, tokenizer, llm, rollout_sampling_params, args.batch_size_per_ei_step,
-                  train_prompts, train_answers, r1_zero_reward_fn, optimizer,
+                  train_prompts, train_answers, r1_zero_reward_fn,
                   args.gradient_accumulation_steps, args.microbatch_size, train_device, eval_prompts,
-                  eval_answers, args.eval_steps, eval_sampling_params, args.output_dir, args.G)
+                  eval_answers, args.eval_steps, eval_sampling_params, args.output_dir, args.G, args.learning_rate)

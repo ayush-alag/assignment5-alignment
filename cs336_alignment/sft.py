@@ -17,7 +17,7 @@ from cs336_alignment.baseline import evaluate_vllm, r1_zero_reward_fn, load_and_
 
 QWEN_BASE_PATH = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.35):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.25):
     """
     Start the inference process, here we use vLLM to hold a model on
     a GPU separate from the policy.

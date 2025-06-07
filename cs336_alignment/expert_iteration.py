@@ -24,7 +24,7 @@ def training_loop(n_ei_steps, model, tokenizer, vllm_model, sampling_params, bat
         batch_prompts = [train_prompts[i] for i in batch_indices]
         batch_answers = [train_answers[i] for i in batch_indices]
 
-        responses, _ = run_vllm(vllm_model, batch_prompts, sampling_params)
+        responses = run_vllm(vllm_model, batch_prompts, sampling_params)
         print("num prompts:", len(batch_prompts))
         print("num generated:", len(responses))
 

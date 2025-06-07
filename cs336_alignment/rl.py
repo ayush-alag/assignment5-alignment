@@ -5,12 +5,14 @@ import statistics
 import torch
 from typing import Literal
 from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, \
-                                load_and_format_prompts, init_vllm, load_policy_into_vllm_instance, log_generations
+                                load_and_format_prompts, init_vllm, load_policy_into_vllm_instance, log_generations, \
+                                tokenize_prompt_and_output
 from vllm import SamplingParams
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.baseline import run_vllm
 import random
 from tqdm import tqdm
+import wandb
 
 def compute_group_normalized_rewards(
     reward_fn,
@@ -83,7 +85,6 @@ def compute_policy_gradient_loss(
     cliprange: float | None= None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if loss_type == "no_baseline":
-        print(raw_rewards.shape, policy_log_probs.shape)
         return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), {}
     elif loss_type == "reinforce_with_baseline":
         return compute_naive_policy_gradient_loss(advantages, policy_log_probs), {}
@@ -123,7 +124,6 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     group_size, rollout_sampling_params, eval_sampling_params,
                     n_train_steps_per_rollout_batch, train_batch_size, micro_train_batch_size,
                     gradient_accumulation_steps, n_prompts_per_rollout_batch,
-                    n_microbatches_per_rollout_batch,
                     loss_type, use_std_normalization,
                     reward_fn, model, tokenizer, llm, train_prompts,
                     train_answers, output_dir, cliprange, eval_steps,
@@ -141,49 +141,82 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
         batch_answers = [train_answers[i] for i in batch_indices]
 
         # now these are size rollout_batch_size (n_prompts_per_rollout_batch * group_size) = 256
-        responses, log_probs = run_vllm(llm, batch_prompts, rollout_sampling_params, log_probs=True)
+        batch_responses = run_vllm(llm, batch_prompts, rollout_sampling_params)
+
         print("num prompts:", len(batch_prompts))
-        print("num generated:", len(responses))
+        print("num generated:", len(batch_responses))
 
         repeated_ground_truths = []
-        for answer in batch_answers:
+        repeated_batch_prompts = []
+        for answer, prompt in zip(batch_answers, batch_prompts):
             repeated_ground_truths.extend([answer] * group_size)
+            repeated_batch_prompts.extend([prompt] * group_size)
 
         advantages, raw_rewards, metadata = compute_group_normalized_rewards(
-            reward_fn, responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
+            reward_fn, batch_responses, repeated_ground_truths, group_size, advantage_eps, use_std_normalization
         )
 
-        # TODO: set old_policy here
+        info_dict = tokenize_prompt_and_output(repeated_batch_prompts, batch_responses, tokenizer)
+        input_ids = info_dict["input_ids"].to(device)
+        labels = info_dict["labels"].to(device)
+        response_mask = info_dict["response_mask"].to(device)
 
+        model.eval()
+        with torch.no_grad():
+            old_log_probs = torch.cat([
+                get_response_log_probs(
+                    model,
+                    input_ids[microbatch_idx:microbatch_idx+micro_train_batch_size],
+                    labels[microbatch_idx:microbatch_idx+micro_train_batch_size],
+                    return_token_entropy=True)["log_probs"].to(device)
+                for microbatch_idx in range(0, len(batch_responses), micro_train_batch_size)])
+
+        model.train()
         # this is 1 for on-policy, > 1 for off-policy --> this is unrelated to train batch size
         for j in range(n_train_steps_per_rollout_batch):
             # micro_train_batch_size = 256/128 = 2
             # now we have rollout_batch_size for rewards, advantages, etc
-            for microbatch_idx in tqdm(range(0, len(responses), micro_train_batch_size)):
-                microbatch_responses = responses[microbatch_idx:microbatch_idx+micro_train_batch_size]
-                microbatch_log_probs = log_probs[microbatch_idx:microbatch_idx+micro_train_batch_size]
-                microbatch_advantages = advantages[microbatch_idx:microbatch_idx+micro_train_batch_size]
-                microbatch_raw_rewards = raw_rewards[microbatch_idx:microbatch_idx+micro_train_batch_size]
+            for microbatch_idx in tqdm(range(0, len(batch_responses), micro_train_batch_size)):
+                start_idx = microbatch_idx
+                end_idx = microbatch_idx + micro_train_batch_size
 
-                policy_log_probs = torch.tensor(microbatch_log_probs)
-                response_mask = torch.ones_like(microbatch_log_probs)
+                microbatch_responses = batch_responses[start_idx:end_idx]
+                microbatch_advantages = torch.tensor(advantages[start_idx:end_idx]).unsqueeze(-1).to(device)
+                microbatch_raw_rewards = torch.tensor(raw_rewards[start_idx:end_idx]).unsqueeze(-1).to(device)
+                microbatch_response_mask = response_mask[start_idx:end_idx]
 
-                # TODO: define policy_log_probs and old_log_probs here
+                microbatch_log_probs = get_response_log_probs(
+                    model,
+                    input_ids[start_idx:end_idx],
+                    labels[start_idx:end_idx],
+                    return_token_entropy=True)
+
+                microbatch_policy_log_probs = microbatch_log_probs["log_probs"].to(device)
+                microbatch_token_entropy = microbatch_log_probs["token_entropy"].to(device)
+                microbatch_old_log_probs = old_log_probs[start_idx:end_idx]
 
                 loss, metadata = grpo_microbatch_train_step(
-                    policy_log_probs, response_mask, gradient_accumulation_steps,
-                    loss_type, raw_rewards, advantages, old_log_probs, cliprange
+                    microbatch_policy_log_probs,
+                    microbatch_response_mask, gradient_accumulation_steps,
+                    loss_type, microbatch_raw_rewards, microbatch_advantages,
+                    microbatch_old_log_probs, cliprange
                 )
-                loss.backward()
 
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/token_entropy": microbatch_token_entropy.mean().item(),
+                    "train_step": total_train_steps,
+                },
+                step=total_train_steps)
                 total_train_steps += 1
-                if total_train_steps % gradient_accumulation_steps == 0:
+
+                if (microbatch_idx + 1) % gradient_accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                if total_train_steps % eval_steps == 0:
-                    eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
-                                                   eval_sampling_params, total_train_steps, n_prompts_per_rollout_batch)
+        if (i + 1) % eval_steps == 0:
+            eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
+                                           eval_sampling_params, total_train_steps=i, num_samples=1024)
 
 if __name__ == "__main__":
     # add relevant args
@@ -211,7 +244,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_data_path", type=str, default="/data/a5-alignment/MATH/validation.jsonl")
     parser.add_argument("--data_amount", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/grpo")
-    parser.add_argument("--eval_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=5)
     args = parser.parse_args()
 
     assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
@@ -262,7 +295,7 @@ if __name__ == "__main__":
                     args.group_size, rollout_sampling_params, eval_sampling_params,
                     args.n_train_steps_per_rollout_batch, args.train_batch_size,
                     micro_train_batch_size, args.gradient_accumulation_steps,
-                    n_prompts_per_rollout_batch, n_microbatches_per_rollout_batch,
+                    n_prompts_per_rollout_batch,
                     args.loss_type, args.use_std_normalization, r1_zero_reward_fn,
                     model, tokenizer, llm, train_prompts, train_answers,
                     args.output_dir, args.cliprange, args.eval_steps,

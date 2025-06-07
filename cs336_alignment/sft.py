@@ -192,8 +192,7 @@ def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn,
                "eval/average_length": average_length,
                "eval/format_reward": avg_format_reward,
                "eval/answer_reward": avg_answer_reward,
-               "eval_step": total_train_steps},
-              step=total_train_steps)
+               "eval_step": total_train_steps})
 
     # print one sample
     print(f"Prompt: {eval_results[0]['prompt']}")
@@ -275,8 +274,7 @@ def sft_training_loop(
                 avg_loss = running_loss / gradient_accumulation_steps
                 wandb.log({"train/loss": avg_loss,
                            "train/token_entropy": token_entropy.mean(),
-                           "train_step": total_train_steps},
-                          step=total_train_steps)
+                           "train_step": total_train_steps})
 
                 progress_bar.set_postfix({"loss": avg_loss, "total_train_steps": total_train_steps})
                 running_loss = 0

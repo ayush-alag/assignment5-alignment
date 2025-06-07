@@ -214,9 +214,12 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     optimizer.step()
                     optimizer.zero_grad()
 
-        if (i + 1) % eval_steps == 0:
-            eval_results = log_generations(model, llm, eval_prompts, eval_answers, reward_fn,
-                                           eval_sampling_params, total_train_steps=i, num_samples=1024)
+        if i % eval_steps == 0 or i == n_grpo_steps - 1:
+            avg_answer_reward, avg_format_reward = log_generations(
+                model, llm, eval_prompts, eval_answers, reward_fn,
+                eval_sampling_params, total_train_steps=i, num_samples=1024)
+
+            print(f"Avg eval reward (total/format): {avg_answer_reward}, {avg_format_reward}")
 
 if __name__ == "__main__":
     # add relevant args

@@ -38,16 +38,16 @@ def evaluate_vllm(
 
 def load_and_format_prompts(data_path: str, prompt_path: str) -> List[str]:
     BASE_DIR = os.path.dirname(__file__)
-    r1_zero_prompt_path = os.path.join(BASE_DIR, prompt_path)
-    with open(r1_zero_prompt_path, "r") as prompt_file:
-        r1_zero_prompt = prompt_file.read()
+    prompt_path = os.path.join(BASE_DIR, prompt_path)
+    with open(prompt_path, "r") as prompt_file:
+        prompt = prompt_file.read()
 
     prompts = []
     answers = []
     with open(data_path, "r") as data_file:
         for line in data_file:
             data = json.loads(line)
-            prompts.append(r1_zero_prompt.format(question=data["problem"]))
+            prompts.append(prompt.format(question=data["problem"]))
             answers.append(data["answer"])
 
     return prompts, answers

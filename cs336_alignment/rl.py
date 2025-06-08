@@ -6,9 +6,9 @@ import torch
 from typing import Literal
 from cs336_alignment.sft import get_response_log_probs, setup_wandb, load_model_and_tokenizer, \
                                 load_and_format_prompts, init_vllm, load_policy_into_vllm_instance, log_generations, \
-                                tokenize_prompt_and_output
+                                tokenize_prompt_and_output, masked_normalize
 from vllm import SamplingParams
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from cs336_alignment.baseline import run_vllm
 import random
 from tqdm import tqdm
@@ -42,10 +42,8 @@ def compute_group_normalized_rewards(
         metadata["avg_reward"].append(avg_reward)
         metadata["std_reward"].append(std_reward)
 
-        raw_adv_rewards = []
         for reward in group_rewards:
             advantage = reward - avg_reward
-            raw_adv_rewards.append(advantage)
             if normalize_by_std:
                 advantage /= (std_reward + advantage_eps)
 
@@ -108,13 +106,18 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None= None,
     old_log_probs: torch.Tensor | None= None,
     cliprange: float | None= None,
+    use_mask_normalize: bool | None= None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     policy_loss, metadata = compute_policy_gradient_loss(
         policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange
     )
 
-    # mean over all dimensions wherever we have a response token
-    response_policy_loss = masked_mean(policy_loss, response_mask)
+    if use_mask_normalize:
+        response_policy_loss = masked_normalize(policy_loss, response_mask, response_mask.shape[0])
+    else:
+        # mean over all dimensions wherever we have a response token
+        response_policy_loss = masked_mean(policy_loss, response_mask)
+
     scaled_response_policy_loss = response_policy_loss / gradient_accumulation_steps
     scaled_response_policy_loss.backward()
 
@@ -127,7 +130,7 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     loss_type, use_std_normalization,
                     reward_fn, model, tokenizer, llm, train_prompts,
                     train_answers, output_dir, cliprange, eval_steps,
-                    eval_prompts, eval_answers):
+                    eval_prompts, eval_answers, max_grad_norm, use_mask_normalize):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     total_train_steps = 0
@@ -166,10 +169,10 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
             old_log_probs = torch.cat([
                 get_response_log_probs(
                     model,
-                    input_ids[microbatch_idx:microbatch_idx+micro_train_batch_size],
-                    labels[microbatch_idx:microbatch_idx+micro_train_batch_size],
+                    input_ids[idx:idx+micro_train_batch_size],
+                    labels[idx:idx+micro_train_batch_size],
                     return_token_entropy=True)["log_probs"].to(device)
-                for microbatch_idx in range(0, len(batch_responses), micro_train_batch_size)])
+                for idx in range(0, len(batch_responses), micro_train_batch_size)])
 
         model.train()
         # this is 1 for on-policy, > 1 for off-policy --> this is unrelated to train batch size
@@ -199,7 +202,7 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     microbatch_policy_log_probs,
                     microbatch_response_mask, gradient_accumulation_steps,
                     loss_type, microbatch_raw_rewards, microbatch_advantages,
-                    microbatch_old_log_probs, cliprange
+                    microbatch_old_log_probs, cliprange, use_mask_normalize
                 )
 
                 wandb.log({
@@ -210,7 +213,23 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                 step=total_train_steps)
                 total_train_steps += 1
 
-                if (microbatch_idx + 1) % gradient_accumulation_steps == 0:
+                if microbatch_idx % gradient_accumulation_steps == 0 or microbatch_idx == len(batch_responses) - 1:
+                    if max_grad_norm:
+                        preclipped_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+                    # also want to log the gradient norm
+                    total_norm = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.detach().data.pow(2).sum().item()
+                    total_norm = total_norm ** 0.5
+
+                    wandb.log({
+                        "train/grad_norm": preclipped_norm,
+                        "train/grad_norm_post_clip": total_norm,
+                        "train_step": total_train_steps,
+                    })
+
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -225,8 +244,8 @@ if __name__ == "__main__":
     # add relevant args
     parser = argparse.ArgumentParser()
     # hyperparameters
-    parser.add_argument("--n_grpo_steps", type=int, default=200)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--n_grpo_steps", type=int, default=75)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--advantage_eps", type=float, default=1e-6)
     parser.add_argument("--rollout_batch_size", type=int, default=256)
     parser.add_argument("--group_size", type=int, default=8)
@@ -248,6 +267,9 @@ if __name__ == "__main__":
     parser.add_argument("--data_amount", type=int, default=-1)
     parser.add_argument("--output_dir", type=str, default="/data/c-aalag/rl/grpo")
     parser.add_argument("--eval_steps", type=int, default=5)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--use_mask_normalize", action="store_true")
+    parser.add_argument("--question_only", action="store_true")
     args = parser.parse_args()
 
     assert args.train_batch_size % args.gradient_accumulation_steps == 0, (
@@ -277,8 +299,7 @@ if __name__ == "__main__":
         n=args.group_size,
         seed=42,
         stop=["</answer>"],
-        include_stop_str_in_output=True,
-        logprobs=1
+        include_stop_str_in_output=True
     )
 
     eval_sampling_params = SamplingParams(
@@ -286,7 +307,8 @@ if __name__ == "__main__":
     )
 
     # eval vllm
-    prompt_path = "prompts/r1_zero.prompt"
+    prompt_path = "prompts/question_only.prompt" if args.question_only else "prompts/r1_zero.prompt"
+    eval_fn = question_only_reward_fn if args.question_only else r1_zero_reward_fn
     train_prompts, train_answers = load_and_format_prompts(args.train_data_path, prompt_path)
     eval_prompts, eval_answers = load_and_format_prompts(args.eval_data_path, prompt_path)
 
@@ -299,7 +321,7 @@ if __name__ == "__main__":
                     args.n_train_steps_per_rollout_batch, args.train_batch_size,
                     micro_train_batch_size, args.gradient_accumulation_steps,
                     n_prompts_per_rollout_batch,
-                    args.loss_type, args.use_std_normalization, r1_zero_reward_fn,
+                    args.loss_type, args.use_std_normalization, eval_fn,
                     model, tokenizer, llm, train_prompts, train_answers,
                     args.output_dir, args.cliprange, args.eval_steps,
-                    eval_prompts, eval_answers)
+                    eval_prompts, eval_answers, args.max_grad_norm, args.use_mask_normalize)

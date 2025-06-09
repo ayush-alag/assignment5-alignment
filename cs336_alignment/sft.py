@@ -176,8 +176,6 @@ def log_generations(model, vllm, eval_prompts, eval_answers, reward_fn,
     for info_dict in eval_results:
         if info_dict["answer_reward"] == 1:
             correct_lengths.append(len(info_dict["response"]))
-            print(info_dict["response"], info_dict["prompt"])
-            exit()
         else:
             incorrect_lengths.append(len(info_dict["response"]))
         format_reward += info_dict["format_reward"]

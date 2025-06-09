@@ -74,9 +74,20 @@ def compute_grpo_clip_loss(
 
     return -torch.min(raw_policy_weight, clipped_policy_weight), metadata
 
+def compute_grpo_unclipped_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    metadata = defaultdict(list)
+
+    importance_ratio = torch.exp(policy_log_probs - old_log_probs)
+    return -advantages * importance_ratio, {}
+
 def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_unclipped"],
     raw_rewards: torch.Tensor | None= None,
     advantages: torch.Tensor | None= None,
     old_log_probs: torch.Tensor | None= None,
@@ -86,9 +97,12 @@ def compute_policy_gradient_loss(
         return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), {}
     elif loss_type == "reinforce_with_baseline":
         return compute_naive_policy_gradient_loss(advantages, policy_log_probs), {}
-    else:
-        assert loss_type == "grpo_clip"
+    elif loss_type == "grpo_clip":
         return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    elif loss_type == "grpo_unclipped":
+        return compute_grpo_unclipped_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
 
 def masked_mean(
     tensor: torch.Tensor,
@@ -101,7 +115,7 @@ def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_unclipped"],
     raw_rewards: torch.Tensor | None= None,
     advantages: torch.Tensor | None= None,
     old_log_probs: torch.Tensor | None= None,
@@ -126,7 +140,7 @@ def grpo_microbatch_train_step(
 def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     group_size, rollout_sampling_params, eval_sampling_params,
                     n_train_steps_per_rollout_batch, train_batch_size, micro_train_batch_size,
-                    gradient_accumulation_steps, n_prompts_per_rollout_batch,
+                    gradient_accumulation_steps, n_prompts_per_rollout_batch, epochs_per_rollout_batch,
                     loss_type, use_std_normalization,
                     reward_fn, model, tokenizer, llm, train_prompts,
                     train_answers, output_dir, cliprange, eval_steps,
@@ -173,12 +187,17 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                     labels[idx:idx+micro_train_batch_size],
                     return_token_entropy=True)["log_probs"].to(device)
                 for idx in range(0, len(batch_responses), micro_train_batch_size)])
+        old_log_probs = old_log_probs.detach()
 
         model.train()
-        # this is 1 for on-policy, > 1 for off-policy --> this is unrelated to train batch size
-        for j in range(n_train_steps_per_rollout_batch):
+
+        for epoch in range(epochs_per_rollout_batch):
+            print(f"GRPO epoch {epoch}")
+            # # this is 1 for on-policy, > 1 for off-policy --> this is unrelated to train batch size
+            # for j in range(n_train_steps_per_rollout_batch):
             # micro_train_batch_size = 256/128 = 2
             # now we have rollout_batch_size for rewards, advantages, etc
+            num_accumulated = 0
             for microbatch_idx in tqdm(range(0, len(batch_responses), micro_train_batch_size)):
                 start_idx = microbatch_idx
                 end_idx = microbatch_idx + micro_train_batch_size
@@ -212,8 +231,9 @@ def grpo_train_loop(n_grpo_steps, learning_rate, advantage_eps,
                 },
                 step=total_train_steps)
                 total_train_steps += 1
+                num_accumulated += 1
 
-                if microbatch_idx % gradient_accumulation_steps == 0 or microbatch_idx == len(batch_responses) - 1:
+                if num_accumulated % gradient_accumulation_steps == 0 or microbatch_idx == len(batch_responses) - 1:
                     if max_grad_norm:
                         preclipped_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
@@ -248,6 +268,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--advantage_eps", type=float, default=1e-6)
     parser.add_argument("--rollout_batch_size", type=int, default=256)
+    parser.add_argument("--epochs_per_rollout_batch", type=int, default=1)
     parser.add_argument("--group_size", type=int, default=8)
     parser.add_argument("--sampling_temperature", type=float, default=1.0)
     parser.add_argument("--sampling_min_tokens", type=int, default=4)
@@ -320,7 +341,7 @@ if __name__ == "__main__":
                     args.group_size, rollout_sampling_params, eval_sampling_params,
                     args.n_train_steps_per_rollout_batch, args.train_batch_size,
                     micro_train_batch_size, args.gradient_accumulation_steps,
-                    n_prompts_per_rollout_batch,
+                    n_prompts_per_rollout_batch, args.epochs_per_rollout_batch,
                     args.loss_type, args.use_std_normalization, eval_fn,
                     model, tokenizer, llm, train_prompts, train_answers,
                     args.output_dir, args.cliprange, args.eval_steps,
